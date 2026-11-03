@@ -1,203 +1,293 @@
-// Minimal web proxy. Node 18+, no dependencies.  Run: node server.js
-import http from "node:http";
-import { readFile } from "node:fs/promises";
+import { timingSafeEqual } from "node:crypto";
 import dns from "node:dns/promises";
+import http from "node:http";
 import net from "node:net";
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
-const PORT = process.env.PORT || 3000;
-const UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
-
-// --- Abuse limits ------------------------------------------------------------
-const MAX_BYTES = 15 * 1024 * 1024; // refuse bigger responses
-const LIMIT = 120;                  // requests per IP per minute
-const hits = new Map();
-setInterval(() => hits.clear(), 60_000).unref();
-const clientIp = (req) =>
-  (process.env.TRUST_PROXY && req.headers["x-forwarded-for"]?.split(",")[0].trim()) ||
-  req.socket.remoteAddress;
-const limited = (req) => {
-  const ip = clientIp(req);
-  const n = (hits.get(ip) || 0) + 1;
-  hits.set(ip, n);
-  return n > LIMIT;
-};
-
-const isBlockedHost = (host) => {
-  const h = (host || "").toLowerCase();
+const isLoopbackHost = (host) => {
+  const value = host.toLowerCase();
   return (
-    !h ||
-    h === "localhost" ||
-    h.endsWith(".localhost") ||
-    h === "localhost.localdomain" ||
-    h.endsWith(".local") ||
-    h.endsWith(".internal") ||
-    h.startsWith("::ffff:")
+    value === "localhost" ||
+    value === "::1" ||
+    value === "[::1]" ||
+    (net.isIPv4(value) && Number(value.split(".")[0]) === 127)
   );
 };
 
-// --- Safety: never let the proxy reach private/internal addresses -----------
-const isPrivate = (ip) => {
-  if (!ip) return true;
-
-  if (net.isIPv4(ip)) {
-    const [a, b, c, d] = ip.split(".").map(Number);
-    if (a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || a === 255) return true;
-    if (a === 172 && b >= 16 && b <= 31) return true;
-    if (a === 192 && b === 168) return true;
-    if (a === 100 && b >= 64 && b <= 127) return true;
-    if (a === 192 && b === 0 && c === 0) return true;
-    if (a === 192 && b === 0 && c === 2) return true;
-    if (a === 192 && b === 88 && c === 99) return true;
-    if (a === 198 && b === 18) return true;
-    if (a === 198 && b === 19) return true;
-    if (a === 198 && b === 51 && c === 100) return true;
-    if (a === 203 && b === 0 && c === 113) return true;
-    if (a >= 224) return true;
-    return false;
+const isPrivateAddress = (address) => {
+  if (net.isIPv4(address)) {
+    const [a, b, c] = address.split(".").map(Number);
+    return (
+      a === 0 ||
+      a === 10 ||
+      a === 127 ||
+      (a === 100 && b >= 64 && b <= 127) ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 0 && (c === 0 || c === 2)) ||
+      (a === 192 && b === 88 && c === 99) ||
+      (a === 192 && b === 168) ||
+      (a === 198 && (b === 18 || b === 19)) ||
+      (a === 198 && b === 51 && c === 100) ||
+      (a === 203 && b === 0 && c === 113) ||
+      a >= 224
+    );
   }
 
-  const l = ip.toLowerCase();
+  const value = address.toLowerCase();
+  if (value.startsWith("::ffff:")) {
+    const mapped = value.slice("::ffff:".length);
+    return net.isIPv4(mapped) ? isPrivateAddress(mapped) : true;
+  }
+
+  const firstHextet = Number.parseInt(value.split(":")[0] || "0", 16);
   return (
-    l === "::1" ||
-    l === "::" ||
-    l.startsWith("::ffff:") ||
-    l.startsWith("fc") ||
-    l.startsWith("fd") ||
-    l.startsWith("fe80")
+    value === "::" ||
+    value === "::1" ||
+    firstHextet < 0x2000 ||
+    firstHextet > 0x3fff ||
+    value.startsWith("2001:db8:") ||
+    value.startsWith("2001:0000:") ||
+    value.startsWith("2002:")
   );
 };
 
-async function assertPublic(u) {
-  if (!/^https?:$/.test(u.protocol)) throw new Error("Only http and https addresses work.");
-  if (u.username || u.password) throw new Error("URLs with embedded credentials are not allowed.");
-  if (isBlockedHost(u.hostname)) throw new Error("That address is not public.");
+class DestinationNotAllowedError extends Error {}
 
-  const addrs = await dns.lookup(u.hostname, { all: true });
-  if (!addrs.length) throw new Error("That host has no public DNS record.");
-  if (addrs.some((a) => isPrivate(a.address))) throw new Error("That address is private.");
-}
-
-// --- Rewriting ---------------------------------------------------------------
-const prox = (u, base) => {
-  try {
-    return "/go?url=" + encodeURIComponent(new URL(u, base).href);
-  } catch {
-    return u;
+const resolvePublicTarget = async (hostname) => {
+  const host = hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  if (
+    !host ||
+    host.includes("%") ||
+    host === "localhost" ||
+    host.endsWith(".localhost") ||
+    host.endsWith(".local") ||
+    host.endsWith(".internal")
+  ) {
+    throw new DestinationNotAllowedError("Private and local destinations are not allowed.");
   }
+
+  const addresses = net.isIP(host)
+    ? [{ address: host, family: net.isIP(host) }]
+    : await dns.lookup(host, { all: true, verbatim: true });
+
+  if (!addresses.length || addresses.some(({ address }) => isPrivateAddress(address))) {
+    throw new DestinationNotAllowedError("Private and local destinations are not allowed.");
+  }
+
+  return addresses[0];
 };
-const skip = /^(#|data:|javascript:|mailto:|tel:|blob:|about:)/i;
 
-const rewriteCss = (css, base) =>
-  css
-    .replace(/url\(\s*(["']?)(?!data:)(.*?)\1\s*\)/gi, (m, q, v) => `url(${q}${prox(v, base)}${q})`)
-    .replace(/@import\s+(["'])(.*?)\1/gi, (m, q, v) => `@import ${q}${prox(v, base)}${q}`);
+const isHopByHop = (headers) => {
+  const names = new Set([
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+  ]);
+  const connection = Array.isArray(headers.connection)
+    ? headers.connection.join(",")
+    : headers.connection || "";
+  for (const token of connection.split(",")) {
+    names.add(token.trim().toLowerCase());
+  }
+  return names;
+};
 
-const clientScript = (base) => `<script>(function(){
-var B=${JSON.stringify(base)};
-function P(u){try{if(String(u).indexOf("/go?url=")===0)return u;return "/go?url="+encodeURIComponent(new URL(u,B).href)}catch(e){return u}}
-var f=window.fetch;window.fetch=function(i,o){return f(typeof i==="string"||i instanceof URL?P(i):i,o)};
-var x=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){arguments[1]=P(u);return x.apply(this,arguments)};
-document.addEventListener("submit",function(e){
-  var form=e.target;if((form.method||"get").toLowerCase()!=="get")return;
-  e.preventDefault();
-  var real=new URL(new URL(form.action,location.href).searchParams.get("url")||B);
-  new FormData(form).forEach(function(v,k){if(typeof v==="string")real.searchParams.set(k,v)});
-  location.href=P(real.href);
-},true);
-})();</script>`;
+const forwardedHeaders = (headers) => {
+  const filtered = { ...headers };
+  for (const name of isHopByHop(headers)) delete filtered[name];
+  return filtered;
+};
 
-function rewriteHtml(html, base) {
-  html = html
-    .replace(/<meta[^>]+http-equiv=["']?content-security-policy[^>]*>/gi, "")
-    .replace(/\sintegrity=(["']).*?\1/gi, "")
-    .replace(/(\s(?:href|src|action|poster)=)(["'])(.*?)\2/gi, (m, a, q, v) => {
-      v = v.trim().replace(/&amp;/g, "&");
-      return skip.test(v) ? m : `${a}${q}${prox(v, base)}${q}`;
-    })
-    .replace(/\ssrcset=(["'])(.*?)\1/gi, (m, q, v) => {
-      const out = v
-        .split(",")
-        .map((p) => {
-          const [u, ...rest] = p.trim().split(/\s+/);
-          return [prox(u, base), ...rest].join(" ");
-        })
-        .join(", ");
-      return ` srcset=${q}${out}${q}`;
+const sendResponse = (res, status, message, headers = {}) => {
+  res.writeHead(status, {
+    "content-type": "text/plain; charset=utf-8",
+    connection: "close",
+    ...headers,
+  });
+  res.end(`${message}\n`);
+};
+
+const sendTunnelResponse = (socket, status, reason, headers = "") => {
+  socket.end(`HTTP/1.1 ${status} ${reason}\r\n${headers}Connection: close\r\n\r\n`);
+};
+
+const hasValidCredentials = (header, username, password) => {
+  if (!header?.startsWith("Basic ")) return false;
+  const supplied = Buffer.from(header.slice(6), "base64");
+  const expected = Buffer.from(`${username}:${password}`);
+  return supplied.length === expected.length && timingSafeEqual(supplied, expected);
+};
+
+export function createProxyServer({
+  host = "127.0.0.1",
+  username,
+  password,
+  resolveTarget = resolvePublicTarget,
+  connect = net.connect,
+} = {}) {
+  if ((username && !password) || (!username && password)) {
+    throw new Error("Set both PROXY_USERNAME and PROXY_PASSWORD, or neither.");
+  }
+  if (!isLoopbackHost(host) && (!username || !password)) {
+    throw new Error("Credentials are required when listening on a non-loopback interface.");
+  }
+
+  const authenticate = (req, res) => {
+    if (!username || hasValidCredentials(req.headers["proxy-authorization"], username, password)) {
+      return true;
+    }
+    sendResponse(res, 407, "Proxy authentication required.", {
+      "proxy-authenticate": 'Basic realm="AnglerProxy"',
     });
-  html = rewriteCss(html, base); // inline <style> blocks and style="" attributes
-  const inject = clientScript(base);
-  return /<head[^>]*>/i.test(html) ? html.replace(/<head[^>]*>/i, (m) => m + inject) : inject + html;
-}
+    return false;
+  };
 
-// --- Server ------------------------------------------------------------------
-const page = (msg) =>
-  `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">` +
-  `<body style="font:16px system-ui;max-width:32rem;margin:20vh auto;padding:0 1rem">` +
-  `<p>${msg}</p><p><a href="/">Back</a></p>`;
+  const server = http.createServer((req, res) => {
+    if (!authenticate(req, res)) return;
 
-http
-  .createServer(async (req, res) => {
-    const here = new URL(req.url, "http://localhost");
-
-    if (here.pathname === "/") {
-      res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-      return res.end(await readFile(new URL("./index.html", import.meta.url)));
-    }
-    if (here.pathname !== "/go") {
-      res.writeHead(404, { "content-type": "text/html" });
-      return res.end(page("Page not found."));
-    }
-
-    if (limited(req)) {
-      res.writeHead(429, { "content-type": "text/html; charset=utf-8", "retry-after": "60" });
-      return res.end(page("Too many requests. Try again in a minute."));
-    }
-
+    let target;
     try {
-      const target = new URL(here.searchParams.get("url") || "");
-      if (target.host === req.headers.host) throw new Error("That address points back to this proxy.");
-      await assertPublic(target);
+      target = new URL(req.url);
+      if (target.protocol !== "http:" || target.username || target.password) {
+        throw new Error("Only absolute HTTP URLs without credentials are supported.");
+      }
+    } catch (error) {
+      sendResponse(res, 400, error.message);
+      return;
+    }
 
-      const upstream = await fetch(target, {
-        redirect: "manual",
-        signal: AbortSignal.timeout(15000),
-        headers: {
-          "user-agent": UA,
-          accept: req.headers.accept || "*/*",
-          "accept-language": req.headers["accept-language"] || "en-US,en;q=0.9",
-        },
+    void (async () => {
+      const destination = await resolveTarget(target.hostname);
+      const headers = forwardedHeaders(req.headers);
+      headers.host = target.host;
+      headers.connection = "close";
+      const upstream = http.request({
+        host: destination.address,
+        family: destination.family,
+        port: target.port || 80,
+        method: req.method,
+        path: `${target.pathname}${target.search}`,
+        headers,
+        agent: false,
       });
 
-      if (upstream.status >= 300 && upstream.status < 400 && upstream.headers.get("location")) {
-        res.writeHead(302, { location: prox(upstream.headers.get("location"), target) });
-        return res.end();
-      }
-
-      if (Number(upstream.headers.get("content-length")) > MAX_BYTES) {
-        throw new Error("That file is too large.");
-      }
-      const type = upstream.headers.get("content-type") || "application/octet-stream";
-      const headers = {
-        "content-type": type,
-        "cache-control": "no-store",
-        "x-content-type-options": "nosniff",
-      };
-      let body;
-
-      if (/text\/html/i.test(type)) {
-        body = rewriteHtml(await upstream.text(), target.href);
-      } else if (/text\/css/i.test(type)) {
-        body = rewriteCss(await upstream.text(), target.href);
+      upstream.on("response", (upstreamRes) => {
+        const responseHeaders = forwardedHeaders(upstreamRes.headers);
+        responseHeaders.connection = "close";
+        res.writeHead(upstreamRes.statusCode, upstreamRes.statusMessage, responseHeaders);
+        upstreamRes.pipe(res);
+      });
+      upstream.on("error", (error) => {
+        if (!req.aborted) console.error("HTTP proxy upstream error:", error.message);
+        if (!res.headersSent) sendResponse(res, 502, "Unable to reach the destination.");
+        else res.destroy();
+      });
+      req.on("aborted", () => upstream.destroy());
+      req.pipe(upstream);
+    })().catch((error) => {
+      const denied = error instanceof DestinationNotAllowedError;
+      if (!denied) console.error("HTTP proxy request error:", error.message);
+      if (!res.headersSent) {
+        sendResponse(
+          res,
+          denied ? 403 : 502,
+          denied ? "Destination is not allowed." : "Unable to reach the destination.",
+        );
       } else {
-        body = Buffer.from(await upstream.arrayBuffer());
+        res.destroy();
       }
+    });
+  });
 
-      res.writeHead(upstream.status, headers);
-      res.end(body);
-    } catch (err) {
-      res.writeHead(502, { "content-type": "text/html; charset=utf-8" });
-      res.end(page(`Couldn't load that page. ${err.message}`));
+  server.on("connect", (req, clientSocket, head) => {
+    if (username && !hasValidCredentials(req.headers["proxy-authorization"], username, password)) {
+      sendTunnelResponse(
+        clientSocket,
+        407,
+        "Proxy Authentication Required",
+        'Proxy-Authenticate: Basic realm="AnglerProxy"\r\n',
+      );
+      return;
     }
-  })
-  .listen(PORT, () => console.log(`Proxy running at http://localhost:${PORT}`));
+
+    let target;
+    try {
+      target = new URL(`https://${req.url}`);
+      if (
+        target.username ||
+        target.password ||
+        (target.port && target.port !== "443")
+      ) {
+        throw new Error("Only HTTPS tunnels on port 443 are supported.");
+      }
+    } catch {
+      sendTunnelResponse(clientSocket, 400, "Bad Request");
+      return;
+    }
+
+    void (async () => {
+      const destination = await resolveTarget(target.hostname);
+      const upstream = connect({
+        host: destination.address,
+        family: destination.family,
+        port: 443,
+      });
+
+      const timeout = setTimeout(() => upstream.destroy(), 15_000);
+      timeout.unref();
+      let tunnelEstablished = false;
+      upstream.once("connect", () => {
+        tunnelEstablished = true;
+        clearTimeout(timeout);
+        clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+        if (head.length) upstream.write(head);
+        upstream.pipe(clientSocket);
+        clientSocket.pipe(upstream);
+      });
+      upstream.on("error", (error) => {
+        clearTimeout(timeout);
+        if (!tunnelEstablished) {
+          console.error("HTTPS proxy connection error:", error.message);
+          if (!clientSocket.destroyed) sendTunnelResponse(clientSocket, 502, "Bad Gateway");
+        } else {
+          clientSocket.destroy();
+        }
+      });
+      clientSocket.on("error", () => upstream.destroy());
+      clientSocket.on("close", () => upstream.destroy());
+    })().catch((error) => {
+      const denied = error instanceof DestinationNotAllowedError;
+      if (!denied) console.error("HTTPS proxy tunnel error:", error.message);
+      if (!clientSocket.destroyed) {
+        sendTunnelResponse(clientSocket, denied ? 403 : 502, denied ? "Forbidden" : "Bad Gateway");
+      }
+    });
+  });
+
+  server.on("clientError", (_error, socket) => {
+    sendTunnelResponse(socket, 400, "Bad Request");
+  });
+
+  return server;
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  const port = Number(process.env.PORT || 3000);
+  const host = process.env.HOST || "127.0.0.1";
+  const server = createProxyServer({
+    host,
+    username: process.env.PROXY_USERNAME,
+    password: process.env.PROXY_PASSWORD,
+  });
+  server.listen(port, host, () => {
+    console.log(`AnglerProxy listening on ${host}:${port}`);
+  });
+}
