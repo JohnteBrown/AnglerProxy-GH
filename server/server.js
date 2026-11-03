@@ -23,25 +23,58 @@ const limited = (req) => {
   return n > LIMIT;
 };
 
+const isBlockedHost = (host) => {
+  const h = (host || "").toLowerCase();
+  return (
+    !h ||
+    h === "localhost" ||
+    h.endsWith(".localhost") ||
+    h === "localhost.localdomain" ||
+    h.endsWith(".local") ||
+    h.endsWith(".internal") ||
+    h.startsWith("::ffff:")
+  );
+};
+
 // --- Safety: never let the proxy reach private/internal addresses -----------
 const isPrivate = (ip) => {
+  if (!ip) return true;
+
   if (net.isIPv4(ip)) {
-    const [a, b] = ip.split(".").map(Number);
-    return (
-      a === 0 || a === 10 || a === 127 ||
-      (a === 169 && b === 254) ||
-      (a === 172 && b >= 16 && b <= 31) ||
-      (a === 192 && b === 168) ||
-      (a === 100 && b >= 64 && b <= 127)
-    );
+    const [a, b, c, d] = ip.split(".").map(Number);
+    if (a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || a === 255) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true;
+    if (a === 192 && b === 0 && c === 0) return true;
+    if (a === 192 && b === 0 && c === 2) return true;
+    if (a === 192 && b === 88 && c === 99) return true;
+    if (a === 198 && b === 18) return true;
+    if (a === 198 && b === 19) return true;
+    if (a === 198 && b === 51 && c === 100) return true;
+    if (a === 203 && b === 0 && c === 113) return true;
+    if (a >= 224) return true;
+    return false;
   }
+
   const l = ip.toLowerCase();
-  return l === "::1" || l === "::" || /^(fc|fd|fe80|::ffff:)/.test(l);
+  return (
+    l === "::1" ||
+    l === "::" ||
+    l.startsWith("::ffff:") ||
+    l.startsWith("fc") ||
+    l.startsWith("fd") ||
+    l.startsWith("fe80")
+  );
 };
 
 async function assertPublic(u) {
   if (!/^https?:$/.test(u.protocol)) throw new Error("Only http and https addresses work.");
+  if (u.username || u.password) throw new Error("URLs with embedded credentials are not allowed.");
+  if (isBlockedHost(u.hostname)) throw new Error("That address is not public.");
+
   const addrs = await dns.lookup(u.hostname, { all: true });
+  if (!addrs.length) throw new Error("That host has no public DNS record.");
   if (addrs.some((a) => isPrivate(a.address))) throw new Error("That address is private.");
 }
 
@@ -145,7 +178,11 @@ http
         throw new Error("That file is too large.");
       }
       const type = upstream.headers.get("content-type") || "application/octet-stream";
-      const headers = { "content-type": type, "cache-control": "no-store" };
+      const headers = {
+        "content-type": type,
+        "cache-control": "no-store",
+        "x-content-type-options": "nosniff",
+      };
       let body;
 
       if (/text\/html/i.test(type)) {
