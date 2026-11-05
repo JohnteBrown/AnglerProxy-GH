@@ -2,6 +2,7 @@ import { timingSafeEqual } from "node:crypto";
 import dns from "node:dns/promises";
 import http from "node:http";
 import net from "node:net";
+import pino from "pino";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -132,6 +133,7 @@ export function createProxyServer({
   password,
   resolveTarget = resolvePublicTarget,
   connect = net.connect,
+  logger = pino(),
 } = {}) {
   if ((username && !password) || (!username && password)) {
     throw new Error("Set both PROXY_USERNAME and PROXY_PASSWORD, or neither.");
@@ -151,6 +153,13 @@ export function createProxyServer({
   };
 
   const server = http.createServer((req, res) => {
+    res.once("finish", () => {
+      logger.info(
+        { method: req.method, url: req.url, statusCode: res.statusCode },
+        "proxy request",
+      );
+    });
+
     if (!authenticate(req, res)) return;
 
     let target;
@@ -208,7 +217,15 @@ export function createProxyServer({
   });
 
   server.on("connect", (req, clientSocket, head) => {
+    let requestLogged = false;
+    const logRequest = (statusCode) => {
+      if (requestLogged) return;
+      requestLogged = true;
+      logger.info({ method: req.method, url: req.url, statusCode }, "proxy request");
+    };
+
     if (username && !hasValidCredentials(req.headers["proxy-authorization"], username, password)) {
+      logRequest(407);
       sendTunnelResponse(
         clientSocket,
         407,
@@ -229,6 +246,7 @@ export function createProxyServer({
         throw new Error("Only HTTPS tunnels on port 443 are supported.");
       }
     } catch {
+      logRequest(400);
       sendTunnelResponse(clientSocket, 400, "Bad Request");
       return;
     }
@@ -247,6 +265,7 @@ export function createProxyServer({
       upstream.once("connect", () => {
         tunnelEstablished = true;
         clearTimeout(timeout);
+        logRequest(200);
         clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
         if (head.length) upstream.write(head);
         upstream.pipe(clientSocket);
@@ -256,7 +275,10 @@ export function createProxyServer({
         clearTimeout(timeout);
         if (!tunnelEstablished) {
           console.error("HTTPS proxy connection error:", error.message);
-          if (!clientSocket.destroyed) sendTunnelResponse(clientSocket, 502, "Bad Gateway");
+          if (!clientSocket.destroyed) {
+            logRequest(502);
+            sendTunnelResponse(clientSocket, 502, "Bad Gateway");
+          }
         } else {
           clientSocket.destroy();
         }
@@ -267,6 +289,7 @@ export function createProxyServer({
       const denied = error instanceof DestinationNotAllowedError;
       if (!denied) console.error("HTTPS proxy tunnel error:", error.message);
       if (!clientSocket.destroyed) {
+        logRequest(denied ? 403 : 502);
         sendTunnelResponse(clientSocket, denied ? 403 : 502, denied ? "Forbidden" : "Bad Gateway");
       }
     });
