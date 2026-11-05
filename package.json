@@ -4,7 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "start": "node server/server.js"
   },
   "keywords": [],
   "author": "",
@@ -19,6 +20,7 @@
   "packageManager": "pnpm@12.16.1",
   "type": "module",
   "dependencies": {
-    "express": "^5.3.0"
+    "express": "^5.3.0",
+    "pino": "^10.4.0"
   }
 }
