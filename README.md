@@ -1,7 +1,6 @@
 # AnglerProxy: Going Home
 
-> [!NOTE] a fork of BrotherIontachs AnglerProxy
-> made with love ❤️❤️
+> [!NOTE] a fork of BrotherIontachs AnglerProxy made with love ❤️❤️
 
 AnglerProxy is a small HTTP forward proxy for devices that support manual proxy
 settings, including ChromeOS. It forwards HTTP requests and tunnels HTTPS with
