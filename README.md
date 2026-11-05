@@ -23,7 +23,7 @@ To let another device on a trusted local network connect, bind to the server's
 LAN address and set credentials:
 
 ```ini
-HOST = "192.168.1.50"
+HOST = "127.0.0.1"
 PORT = "3000"
 PROXY_USERNAME = "choose-a-username"
 PROXY_PASSWORD = "choose-a-long-password"
