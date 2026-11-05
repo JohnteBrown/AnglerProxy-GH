@@ -64,6 +64,7 @@ const proxyConnect = (port, headers = "") =>
   });
 
 test("forwards absolute HTTP requests and removes proxy-only headers", async (t) => {
+  const logs = [];
   let observed;
   const upstream = http.createServer((req, res) => {
     observed = {
@@ -82,6 +83,7 @@ test("forwards absolute HTTP requests and removes proxy-only headers", async (t)
   const upstreamPort = await listen(upstream);
   const proxy = createProxyServer({
     resolveTarget: async () => ({ address: "127.0.0.1", family: 4 }),
+    logger: { info: (entry) => logs.push(entry) },
   });
   const proxyPort = await listen(proxy);
   t.after(async () => {
@@ -107,9 +109,15 @@ test("forwards absolute HTTP requests and removes proxy-only headers", async (t)
     host: `public.example:${upstreamPort}`,
     proxyAuthorization: undefined,
   });
+  assert.deepEqual(logs, [{
+    method: "POST",
+    url: `http://public.example:${upstreamPort}/echo?q=1`,
+    statusCode: 200,
+  }]);
 });
 
 test("tunnels HTTPS CONNECT traffic", { timeout: 10_000 }, async (t) => {
+  const logs = [];
   const upstream = net.createServer((socket) => socket.pipe(socket));
   const upstreamPort = await listen(upstream);
   const proxy = createProxyServer({
@@ -117,6 +125,7 @@ test("tunnels HTTPS CONNECT traffic", { timeout: 10_000 }, async (t) => {
     password: "pass",
     resolveTarget: async () => ({ address: "127.0.0.1", family: 4 }),
     connect: () => net.connect({ host: "127.0.0.1", port: upstreamPort }),
+    logger: { info: (entry) => logs.push(entry) },
   });
   const proxyPort = await listen(proxy);
   t.after(async () => {
@@ -152,6 +161,11 @@ test("tunnels HTTPS CONNECT traffic", { timeout: 10_000 }, async (t) => {
 
   assert.match(response, /^HTTP\/1\.1 200 Connection Established\r\n/);
   assert.ok(response.includes("tunnel-data"));
+  assert.deepEqual(logs, [{
+    method: "CONNECT",
+    url: "public.example:443",
+    statusCode: 200,
+  }]);
 });
 
 test("rejects local and private destinations", async (t) => {
