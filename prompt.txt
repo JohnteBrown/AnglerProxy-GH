@@ -1,0 +1,7 @@
+Goal: Add basic request logging to AnglerProxy.
+Context: index.js, lib/proxy.js — currently no logging beyond console.log in the entry.
+Constraints: Use pino for structured logging. Do not add new files outside lib/.
+Done when: npm test passes and each request logs method, URL, and response status.   
+
+
+
