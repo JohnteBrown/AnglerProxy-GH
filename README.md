@@ -1,5 +1,7 @@
 # AnglerProxy: Going Home
-> a fork of BrotherIontachs AnglerProxy
+
+> [!NOTE] a fork of BrotherIontachs AnglerProxy
+> made with love ❤️❤️
 
 AnglerProxy is a small HTTP forward proxy for devices that support manual proxy
 settings, including ChromeOS. It forwards HTTP requests and tunnels HTTPS with
@@ -19,12 +21,11 @@ the computer running it.
 To let another device on a trusted local network connect, bind to the server's
 LAN address and set credentials:
 
-```powershell
-$env:HOST = "192.168.1.50"
-$env:PORT = "3000"
-$env:PROXY_USERNAME = "choose-a-username"
-$env:PROXY_PASSWORD = "choose-a-long-password"
-node .\server\server.js
+```ini
+HOST = "192.168.1.50"
+PORT = "3000"
+PROXY_USERNAME = "choose-a-username"
+PROXY_PASSWORD = "choose-a-long-password"
 ```
 
 Use the address of the computer running AnglerProxy for `HOST`. Allow the
