@@ -11,9 +11,9 @@ settings, including ChromeOS. It forwards HTTP requests and tunnels HTTPS with
 Requires Node.js 20.12 or newer. Copy `.env.example` to `.env`, edit the values
 as needed, then start the proxy from the project directory:
 
-```powershell
-Copy-Item .env.example .env
-node .\index.js
+```bash
+cp .env.example .env
+pnpm start
 ```
 
 By default, the proxy listens on `127.0.0.1:3000`, which is only reachable from
@@ -58,6 +58,6 @@ access to internal services.
 
 ## Tests
 
-```powershell
-npm test
+```bash
+pnpm test
 ```
