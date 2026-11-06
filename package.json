@@ -8,7 +8,10 @@
   },
   "scripts": {
     "test": "node --test",
-    "start": "node index.js"
+    "start": "node index.js",
+    "lint": "oxlint",
+    "lint:fix": "oxlint --fix",
+    "lint:init": "oxlint --init"
   },
   "keywords": [],
   "author": "",
